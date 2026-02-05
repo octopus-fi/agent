@@ -1,0 +1,11 @@
+{
+    "name": "Aggressive",
+    "description": "Maximizes capital efficiency. Tolerates higher LTV for better yields.",
+    "thresholds": {
+        "warning": 6000,
+        "rebalance": 6500,
+        "maxBorrow": 7000,
+        "liquidation": 8000
+    },
+    "actionRules": "Push LTV to 65% for max leverage. Rebalance only when approaching 70%."
+}

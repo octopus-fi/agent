@@ -1,0 +1,11 @@
+{
+  "name": "Conservative",
+  "description": "Prioritizes safety. Maintains low LTV to avoid liquidation even in high volatility.",
+  "thresholds": {
+    "warning": 4500,
+    "rebalance": 5000,
+    "maxBorrow": 5500,
+    "liquidation": 7500
+  },
+  "actionRules": "Strictly keep LTV below 50%. Claim rewards often."
+}

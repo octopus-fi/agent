@@ -1,0 +1,11 @@
+{
+    "name": "Degen",
+    "description": "Living on the edge. Minimized safety buffer.",
+    "thresholds": {
+        "warning": 7000,
+        "rebalance": 7500,
+        "maxBorrow": 7800,
+        "liquidation": 8500
+    },
+    "actionRules": "Ride the liquidation line. Only rebalance at 78%."
+}
