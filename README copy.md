@@ -17,46 +17,99 @@ The AI Agent monitors all authorized vaults and automatically:
 
 ## 🏗️ Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         AI AGENT FLOW                                │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌──────────────────┐                                               │
-│  │   Vault Monitor  │  ← Polls every 60s (configurable)            │
-│  │  (vault-monitor) │                                               │
-│  └────────┬─────────┘                                               │
-│           │                                                          │
-│           ▼                                                          │
-│  ┌──────────────────┐     ┌─────────────────────┐                  │
-│  │   Sui Service    │────▶│  Read Vault State   │                  │
-│  │   (sui-service)  │     │  - Collateral       │                  │
-│  └────────┬─────────┘     │  - Debt             │                  │
-│           │               │  - Pending Rewards  │                  │
-│           ▼               └─────────────────────┘                  │
-│  ┌──────────────────┐                                               │
-│  │ Analyzer Agent   │  ← Gemini API (READ-ONLY, high frequency)    │
-│  │   (analyzer.ts)  │                                               │
-│  │                  │    Input: "LTV is 67%, rewards pending: 5"   │
-│  │                  │    Output: { action: "CLAIM_REWARDS" }       │
-│  └────────┬─────────┘                                               │
-│           │                                                          │
-│           ▼ (Only if action needed)                                 │
-│  ┌──────────────────┐                                               │
-│  │ Executor Agent   │  ← Gemini API with TOOLS (low frequency)     │
-│  │   (executor.ts)  │                                               │
-│  │                  │    Uses function calling:                     │
-│  │                  │    - claim_and_rebalance()                    │
-│  │                  │    - skip_action()                            │
-│  └────────┬─────────┘                                               │
-│           │                                                          │
-│           ▼                                                          │
-│  ┌──────────────────┐     ┌─────────────────────┐                  │
-│  │  Tool Executor   │────▶│  Execute On-Chain   │                  │
-│  │   (tools/*.ts)   │     │  via Sui Service    │                  │
-│  └──────────────────┘     └─────────────────────┘                  │
-│                                                                      │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+
+    %% ---------------------------
+    %% DATA + BLOCKCHAIN SOURCES
+    %% ---------------------------
+    subgraph "Sui Blockchain Layer"
+        A[Vault Objects<br/>Collateral + Debt]
+        B[Stake Position<br/>Pending Rewards]
+        C[Price Oracle]
+        D[AI Adapter Contract<br/>Rebalance + Claim]
+    end
+
+
+    %% ---------------------------
+    %% OCTOPUS AI AGENT
+    %% ---------------------------
+    subgraph "Octopus Finance AI Agent"
+
+        E[Vault Monitor Loop<br/>Runs every 60s]
+
+        F[Tool 1: Vault Reader<br/>Fetch vault state]
+        G[Tool 2: Stake Reader<br/>Fetch reward data]
+        H[Tool 3: Price Reader<br/>Fetch oracle prices]
+        I[Tool 4: Health Calculator<br/>Compute LTV + Risk]
+
+        J[Gemini Analyzer AI<br/>Read-Only Decision Engine]
+
+        K{Action Required?}
+
+        L[Gemini Executor AI<br/>Tool Enabled]
+
+        M[Tool 5: Claim Rewards]
+        N[Tool 6: Rebalance Reserve]
+        O[Tool 7: Skip Action]
+
+        P[Tool 8: On-Chain TX Executor]
+        Q[Result Logger + Metrics Tracker]
+
+    end
+
+
+    %% ---------------------------
+    %% FLOW CONNECTIONS
+    %% ---------------------------
+
+    %% monitoring
+    E --> F
+    E --> G
+    E --> H
+
+    %% data reading
+    F --> A
+    G --> B
+    H --> C
+
+    %% health metrics
+    F --> I
+    G --> I
+    H --> I
+
+    %% AI analysis
+    I --> J
+    J --> K
+
+    %% decision routing
+    K -->|No| Q
+    K -->|Yes| L
+
+    %% executor tools
+    L --> M
+    L --> N
+    L --> O
+
+    %% transaction execution
+    M --> P
+    N --> P
+
+    %% contract interaction
+    P --> D
+
+    %% result feedback loop
+    D --> Q
+    Q --> E
+
+
+    %% ---------------------------
+    %% STYLING
+    %% ---------------------------
+    style J fill:#4285f4,color:#fff
+    style L fill:#7b1fa2,color:#fff
+    style D fill:#00897b,color:#fff
+
 ```
 
 ### Dual API Strategy (Cost Optimization)
