@@ -402,6 +402,4 @@ ANALYZER_MAX_RPM=5
 
 ---
 
-## 📄 License
 
-MIT
