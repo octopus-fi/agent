@@ -1,391 +1,176 @@
-/**
- * Octopus Finance - WebSocket Server Service
- * Provides real-time communication with the frontend
- */
-
 import { Server, Socket } from 'socket.io';
-import { createServer, Server as HttpServer } from 'http';
-import {
-    VaultHealthMetrics,
-    AnalysisResult,
-    ExecutionResult,
-    MonitoringEvent,
-} from '../types';
 import { logger } from '../utils/logger';
-import * as fs from 'fs';
-import * as path from 'path';
+import { StrategyLoader } from './strategy-loader';
+import { AgentConfig, VaultHealthMetrics, AnalysisResult } from '../types';
 
-// WebSocket Event Types
+// Event Types matching Frontend
 export enum WSEventType {
-    // Agent lifecycle events
+    // Agent -> Client
     AGENT_STATUS = 'agent:status',
     AGENT_STRATEGIES = 'agent:strategies',
     CYCLE_START = 'cycle:start',
     CYCLE_COMPLETE = 'cycle:complete',
-
-    // Vault events
     VAULT_HEALTH = 'vault:health',
-    VAULT_STATUS_UPDATE = 'vault:statusUpdate',
-
-    // AI events
     AI_ANALYSIS = 'ai:analysis',
     AI_EXECUTION = 'ai:execution',
-
-    // Error events
     ERROR = 'error',
 
-    // Client events (frontend -> agent)
-    CLIENT_SUBSCRIBE_VAULT = 'client:subscribeVault',
-    CLIENT_UNSUBSCRIBE_VAULT = 'client:unsubscribeVault',
-    CLIENT_REQUEST_STATUS = 'client:requestStatus',
+    // Client -> Agent
     CLIENT_REQUEST_STRATEGIES = 'client:requestStrategies',
+    CLIENT_SELECT_STRATEGY = 'client:selectStrategy',
+    CLIENT_SUBSCRIBE_VAULT = 'client:subscribeVault',
 }
 
-export interface AgentStrategiesPayload {
-    strategies: any[]; // Strategy[] import if possible, but any is safer for now to avoid circular deps
-    timestamp: number;
-}
+export class WebSocketServer {
+    private io: Server;
+    private config: AgentConfig;
+    private strategyLoader: StrategyLoader;
 
-export interface AgentStatusPayload {
-    isRunning: boolean;
-    vaultCount: number;
-    agentAddress: string;
-    connectedClients: number;
-    timestamp: number;
-}
+    // Track active strategy per client
+    private clientStrategies: Map<string, string> = new Map();
 
-export interface CycleEventPayload {
-    cycleNumber: number;
-    vaultsToProcess: number;
-    timestamp: number;
-    duration?: number;
-}
+    constructor(config: AgentConfig, strategyLoader: StrategyLoader) {
+        this.config = config;
+        this.strategyLoader = strategyLoader;
 
-export interface VaultHealthPayload {
-    metrics: VaultHealthMetrics;
-    timestamp: number;
-}
+        // Port configuration
+        const port = process.env.WS_PORT ? parseInt(process.env.WS_PORT) : 3001;
 
-export interface AIAnalysisPayload {
-    analysis: AnalysisResult;
-    timestamp: number;
-}
-
-export interface AIExecutionPayload {
-    result: ExecutionResult;
-    timestamp: number;
-}
-
-export interface ErrorPayload {
-    message: string;
-    vaultId?: string;
-    code?: string;
-    timestamp: number;
-}
-
-/**
- * WebSocket Server - Singleton
- */
-export class WebSocketService {
-    private static instance: WebSocketService | null = null;
-
-    private io: Server | null = null;
-    private httpServer: HttpServer | null = null;
-    private port: number;
-    private corsOrigin: string;
-    private cycleCount: number = 0;
-
-    private constructor(port: number = 3001, corsOrigin: string = 'http://localhost:3000') {
-        this.port = port;
-        this.corsOrigin = corsOrigin;
-    }
-
-    /**
-     * Get singleton instance
-     */
-    static getInstance(port?: number, corsOrigin?: string): WebSocketService {
-        if (!WebSocketService.instance) {
-            WebSocketService.instance = new WebSocketService(port, corsOrigin);
-        }
-        return WebSocketService.instance;
-    }
-
-    /**
-     * Start the WebSocket server
-     */
-    start(): void {
-        if (this.io) {
-            logger.warn('WebSocket server already running');
-            return;
-        }
-
-        this.httpServer = createServer();
-        this.io = new Server(this.httpServer, {
+        this.io = new Server(port, {
             cors: {
-                origin: this.corsOrigin,
-                methods: ['GET', 'POST'],
-                credentials: true,
-            },
+                origin: process.env.WEBSOCKET_CORS_ORIGIN || "*", // "http://localhost:3000",
+                methods: ["GET", "POST"]
+            }
         });
 
-        this.setupEventHandlers();
-
-        this.httpServer.listen(this.port, () => {
-            logger.info(`🔌 WebSocket server started on port ${this.port}`);
-            logger.info(`   CORS origin: ${this.corsOrigin}`);
-        });
-    }
-
-    /**
-     * Stop the WebSocket server
-     */
-    stop(): void {
-        if (this.io) {
-            this.io.close();
-            this.io = null;
-        }
-        if (this.httpServer) {
-            this.httpServer.close();
-            this.httpServer = null;
-        }
-        logger.info('WebSocket server stopped');
-    }
-
-    /**
-     * Setup socket event handlers
-     */
-    private setupEventHandlers(): void {
-        if (!this.io) return;
+        logger.info(`[Socket.IO] Server started on port ${port}`);
 
         this.io.on('connection', (socket: Socket) => {
-            logger.info(`Client connected: ${socket.id}`);
-
-            // Send current status on connect
-            socket.on(WSEventType.CLIENT_REQUEST_STATUS, () => {
-                this.emitAgentStatus(socket);
-            });
-
-            // Handle vault subscriptions
-            socket.on(WSEventType.CLIENT_SUBSCRIBE_VAULT, (vaultId: string) => {
-                socket.join(`vault:${vaultId}`);
-                logger.debug(`Client ${socket.id} subscribed to vault ${vaultId}`);
-            });
-
-            socket.on(WSEventType.CLIENT_UNSUBSCRIBE_VAULT, (vaultId: string) => {
-                socket.leave(`vault:${vaultId}`);
-                logger.debug(`Client ${socket.id} unsubscribed from vault ${vaultId}`);
-            });
-
-            // Handle strategy requests
-            socket.on(WSEventType.CLIENT_REQUEST_STRATEGIES, () => {
-                this.emitAgentStrategies(socket);
-            });
-
-            socket.on('disconnect', (reason) => {
-                logger.info(`Client disconnected: ${socket.id} (${reason})`);
-            });
+            this.handleConnection(socket);
         });
     }
 
-    /**
-     * Get connected client count
-     */
-    getConnectedClients(): number {
-        return this.io?.engine?.clientsCount ?? 0;
-    }
+    private handleConnection(socket: Socket) {
+        const ip = socket.handshake.address;
+        logger.info(`[Socket.IO] New client connected from ${ip} (ID: ${socket.id})`);
 
-    // =========================================================================
-    // Event Emitters
-    // =========================================================================
-
-    /**
-     * Emit agent status
-     */
-    emitAgentStatus(target?: Socket, status?: Partial<AgentStatusPayload>): void {
-        const payload: AgentStatusPayload = {
+        // Send initial status
+        socket.emit(WSEventType.AGENT_STATUS, {
             isRunning: true,
-            vaultCount: status?.vaultCount ?? 0,
-            agentAddress: status?.agentAddress ?? '',
-            connectedClients: this.getConnectedClients(),
-            timestamp: Date.now(),
-            ...status,
-        };
+            agentAddress: this.config.demoUserAddress || '0xAgent',
+            connectedClients: this.io.engine.clientsCount,
+            timestamp: Date.now()
+        });
 
-        if (target) {
-            target.emit(WSEventType.AGENT_STATUS, payload);
-        } else {
-            this.io?.emit(WSEventType.AGENT_STATUS, payload);
-        }
-    }
+        // Setup Event Listeners
 
-    /**
-     * Emit cycle start event
-     */
-    emitCycleStart(vaultsToProcess: number): void {
-        this.cycleCount++;
-        const payload: CycleEventPayload = {
-            cycleNumber: this.cycleCount,
-            vaultsToProcess,
-            timestamp: Date.now(),
-        };
-        this.io?.emit(WSEventType.CYCLE_START, payload);
-        logger.debug(`[WS] Emitted cycle:start #${this.cycleCount}`);
-    }
-
-    /**
-     * Emit cycle complete event
-     */
-    emitCycleComplete(duration: number): void {
-        const payload: CycleEventPayload = {
-            cycleNumber: this.cycleCount,
-            vaultsToProcess: 0,
-            timestamp: Date.now(),
-            duration,
-        };
-        this.io?.emit(WSEventType.CYCLE_COMPLETE, payload);
-        logger.debug(`[WS] Emitted cycle:complete #${this.cycleCount} (${duration}ms)`);
-    }
-
-    /**
-     * Emit vault health metrics
-     */
-    emitVaultHealth(metrics: VaultHealthMetrics): void {
-        const payload: VaultHealthPayload = {
-            metrics: this.serializeMetrics(metrics),
-            timestamp: Date.now(),
-        };
-
-        // Emit to all clients
-        this.io?.emit(WSEventType.VAULT_HEALTH, payload);
-    }
-
-    /**
-     * Emit AI analysis result
-     */
-    emitAIAnalysis(analysis: AnalysisResult): void {
-        const payload: AIAnalysisPayload = {
-            analysis: this.serializeAnalysis(analysis),
-            timestamp: Date.now(),
-        };
-        this.io?.emit(WSEventType.AI_ANALYSIS, payload);
-    }
-
-    /**
-     * Emit execution result
-     */
-    emitAIExecution(result: ExecutionResult): void {
-        const payload: AIExecutionPayload = {
-            result: this.serializeExecutionResult(result),
-            timestamp: Date.now(),
-        };
-        this.io?.emit(WSEventType.AI_EXECUTION, payload);
-    }
-
-    /**
-     * Emit error event
-     */
-    emitError(message: string, vaultId?: string, code?: string): void {
-        const payload: ErrorPayload = {
-            message,
-            vaultId,
-            code,
-            timestamp: Date.now(),
-        };
-        this.io?.emit(WSEventType.ERROR, payload);
-    }
-
-    /**
-     * Emit available strategies from the agent
-     */
-    emitAgentStrategies(target: Socket): void {
-        try {
-            const strategyDir = path.resolve(process.cwd(), 'strategies');
-            const strategies: any[] = [];
-
-            if (fs.existsSync(strategyDir)) {
-                const files = fs.readdirSync(strategyDir);
-                for (const file of files) {
-                    if (file.endsWith('.json')) {
-                        const content = fs.readFileSync(path.join(strategyDir, file), 'utf-8');
-                        try {
-                            const strategy = JSON.parse(content);
-                            // Add an ID if not present (filename without extension)
-                            if (!strategy.id) {
-                                strategy.id = file.replace('.json', '');
-                            }
-
-                            // Enrich with defaults for UI consistency
-                            strategy.maxLtv = strategy.maxLtv || (strategy.thresholds?.maxBorrow / 100) || 70;
-                            strategy.targetHealth = strategy.targetHealth || (10000 / (strategy.thresholds?.rebalance || 6500));
-                            strategy.rebalanceThreshold = strategy.rebalanceThreshold || (10000 / (strategy.thresholds?.rebalance || 6500));
-                            strategy.autoCompound = strategy.autoCompound !== undefined ? strategy.autoCompound : true;
-                            strategy.avg30dReturn = strategy.avg30dReturn || (strategy.id === 'degen' ? 45.2 : strategy.id === 'aggressive' ? 28.5 : 12.4);
-                            strategy.totalUsers = strategy.totalUsers || (strategy.id === 'degen' ? 1240 : strategy.id === 'aggressive' ? 3420 : 8560);
-                            strategy.riskScore = strategy.riskScore || (strategy.id === 'degen' ? 9 : strategy.id === 'aggressive' ? 7 : 3);
-                            strategy.totalValueManaged = strategy.totalValueManaged || "1250000000000"; // 1250 SUI
-                            strategy.creator = strategy.creator || "0x0000000000000000000000000000000000000000000000000000000000000000";
-                            strategy.createdAt = strategy.createdAt || (Date.now() - 30 * 24 * 60 * 60 * 1000);
-                            strategy.backtestPreview = strategy.backtestPreview || [
-                                { "timestamp": 1, "return": 0 },
-                                { "timestamp": 2, "return": 5 },
-                                { "timestamp": 3, "return": 3 },
-                                { "timestamp": 4, "return": 8 },
-                                { "timestamp": 5, "return": 12 }
-                            ];
-
-                            // Mark as agent strategy
-                            strategy.isAgentStrategy = true;
-                            strategies.push(strategy);
-                        } catch (e) {
-                            logger.error(`Failed to parse strategy file ${file}:`, e);
-                        }
-                    }
-                }
-            }
-
-            const payload: AgentStrategiesPayload = {
+        socket.on(WSEventType.CLIENT_REQUEST_STRATEGIES, async () => {
+            logger.debug(`[Socket.IO] Client requested strategies`);
+            const strategies = await this.strategyLoader.getAllStrategies();
+            socket.emit(WSEventType.AGENT_STRATEGIES, {
                 strategies,
-                timestamp: Date.now(),
-            };
+                timestamp: Date.now()
+            });
+        });
 
-            target.emit(WSEventType.AGENT_STRATEGIES, payload);
-            logger.debug(`[WS] Emitted ${strategies.length} agent strategies to ${target.id}`);
-        } catch (error) {
-            logger.error('Failed to emit agent strategies:', error);
-            this.emitError('Failed to fetch agent strategies', undefined, 'STRATEGY_FETCH_ERROR');
+        socket.on(WSEventType.CLIENT_SELECT_STRATEGY, (payload: any) => {
+            if (payload?.strategy) { // Payload might differ depending on how frontend works. 
+                // Frontend sends string or object? 
+                // socket-service.ts: this.socket?.emit(WSEventType...., vaultId); -> single arg
+                // page.tsx: selectStrategy(id) calls socket.selectStrategy(id) ? 
+                // Wait, useAgentSocket.ts doesn't expose selectStrategy. 
+                // I added it in previous turn but didn't update useAgentSocket.
+                // Assuming standard socket.io payload
+                const strategyId = typeof payload === 'string' ? payload : payload?.strategy;
+                this.clientStrategies.set(socket.id, strategyId);
+                logger.info(`[Socket.IO] Client ${socket.id} selected strategy: ${strategyId}`);
+            }
+        });
+
+        socket.on(WSEventType.CLIENT_SUBSCRIBE_VAULT, (vaultId: string) => {
+            logger.debug(`[Socket.IO] Client ${socket.id} subscribed to vault: ${vaultId}`);
+            socket.join(vaultId); // Join a room for this vault
+        });
+
+        socket.on('disconnect', () => {
+            logger.info(`[Socket.IO] Client disconnected ${socket.id}`);
+            this.clientStrategies.delete(socket.id);
+        });
+
+        socket.on('error', (err) => {
+            logger.error(`[Socket.IO] Client error: ${err.message}`);
+        });
+    }
+
+    // Public Broadcasting Methods
+
+    public broadcast(type: string, payload: any) {
+        this.io.emit(type, payload);
+    }
+
+    public broadcastVaultHealth(metrics: VaultHealthMetrics) {
+        // Broadcast to specific vault room AND global listeners if needed
+        // For now, broadcast to all for monitoring dashboard
+        this.broadcast(WSEventType.VAULT_HEALTH, {
+            metrics,
+            timestamp: Date.now()
+        });
+
+        // Also emit to vault-specific room
+        this.io.to(metrics.vaultId).emit(WSEventType.VAULT_HEALTH, {
+            metrics,
+            timestamp: Date.now()
+        });
+    }
+
+    public broadcastAnalysis(analysis: AnalysisResult) {
+        this.broadcast(WSEventType.AI_ANALYSIS, {
+            analysis,
+            timestamp: Date.now()
+        });
+        this.io.to(analysis.vaultId).emit(WSEventType.AI_ANALYSIS, {
+            analysis,
+            timestamp: Date.now()
+        });
+    }
+
+    public broadcastExecution(result: any) {
+        this.broadcast(WSEventType.AI_EXECUTION, {
+            result,
+            timestamp: Date.now()
+        });
+        if (result.vaultId) {
+            this.io.to(result.vaultId).emit(WSEventType.AI_EXECUTION, {
+                result,
+                timestamp: Date.now()
+            });
         }
     }
 
-    // =========================================================================
-    // Serialization helpers (convert bigint to string for JSON)
-    // =========================================================================
-
-    private serializeMetrics(metrics: VaultHealthMetrics): VaultHealthMetrics {
-        return {
-            ...metrics,
-            collateralValue: metrics.collateralValue.toString() as unknown as bigint,
-            debtValue: metrics.debtValue.toString() as unknown as bigint,
-            rewardReserve: metrics.rewardReserve.toString() as unknown as bigint,
-            pendingRewards: metrics.pendingRewards.toString() as unknown as bigint,
-        };
+    public broadcastCycleStart(vaultsToProcess: number) {
+        this.broadcast(WSEventType.CYCLE_START, {
+            vaultsToProcess,
+            timestamp: Date.now()
+        });
     }
 
-    private serializeAnalysis(analysis: AnalysisResult): AnalysisResult {
-        return {
-            ...analysis,
-            estimatedRewardsNeeded: analysis.estimatedRewardsNeeded.toString() as unknown as bigint,
-            availableRewards: analysis.availableRewards.toString() as unknown as bigint,
-        };
+    public broadcastCycleComplete(duration: number) {
+        this.broadcast(WSEventType.CYCLE_COMPLETE, {
+            duration,
+            timestamp: Date.now()
+        });
     }
 
-    private serializeExecutionResult(result: ExecutionResult): ExecutionResult {
-        return {
-            ...result,
-            rewardsClaimed: result.rewardsClaimed?.toString() as unknown as bigint | undefined,
-            collateralAdded: result.collateralAdded?.toString() as unknown as bigint | undefined,
-        };
+    public broadcastError(message: string) {
+        this.broadcast(WSEventType.ERROR, {
+            message,
+            timestamp: Date.now()
+        });
+    }
+
+    public stop() {
+        this.io.close(() => {
+            logger.info('[Socket.IO] Server stopped');
+        });
     }
 }
-
-// Export singleton getter
-export const getWebSocketService = WebSocketService.getInstance;

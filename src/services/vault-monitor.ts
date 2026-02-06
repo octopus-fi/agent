@@ -14,7 +14,7 @@ import {
 import { SuiService } from "./sui-service";
 import { AnalyzerAgent } from "../agents/analyzer";
 import { ExecutorAgent } from "../agents/executor";
-import { getWebSocketService } from "./websocket-server";
+import { WebSocketServer } from "./websocket-server";
 import { logger } from "../utils/logger";
 import { SCALE_FACTOR } from "../config";
 
@@ -23,6 +23,7 @@ export class VaultMonitor {
   private suiService: SuiService;
   private analyzer: AnalyzerAgent;
   private executor: ExecutorAgent;
+  private wsServer?: WebSocketServer;
   private isRunning: boolean = false;
   private monitorInterval: NodeJS.Timeout | null = null;
 
@@ -37,6 +38,10 @@ export class VaultMonitor {
     this.suiService = new SuiService(config);
     this.analyzer = new AnalyzerAgent(config);
     this.executor = new ExecutorAgent(config, this.suiService);
+  }
+
+  public setWebSocketServer(wsServer: WebSocketServer) {
+    this.wsServer = wsServer;
   }
 
   /**
@@ -197,9 +202,6 @@ export class VaultMonitor {
     const cycleStart = Date.now();
     logger.info("Starting monitoring cycle...");
 
-    // Get WebSocket service for emitting events
-    const wsService = getWebSocketService();
-
     try {
       await this.refreshCachedData();
 
@@ -208,12 +210,12 @@ export class VaultMonitor {
       // ────────────────────────────────────────────────────────────────────
 
       // Emit cycle start via WebSocket
-      wsService.emitCycleStart(metricsArray.length);
+      this.wsServer?.broadcastCycleStart(metricsArray.length);
 
       for (const m of metricsArray) {
         this.logVaultStatus(m);
         // Emit vault health via WebSocket
-        wsService.emitVaultHealth(m);
+        this.wsServer?.broadcastVaultHealth(m);
       }
 
       // Run AI analysis (hits Gemini for every vault)
@@ -235,7 +237,7 @@ export class VaultMonitor {
           `   → Action: ${a.action} | Reasoning: ${a.reasoning} | Confidence: ${a.confidence}`,
         );
         // Emit AI analysis via WebSocket
-        wsService.emitAIAnalysis(a);
+        this.wsServer?.broadcastAnalysis(a);
       }
 
       // Execute actions (hits Gemini tool-calling, then SuiService)
@@ -249,14 +251,14 @@ export class VaultMonitor {
 
       // Emit execution results via WebSocket
       for (const result of results) {
-        wsService.emitAIExecution(result);
+        this.wsServer?.broadcastExecution(result);
       }
     } catch (error) {
       logger.error("Monitoring cycle error:", error);
       const errorMsg = error instanceof Error ? error.message : "Unknown error";
 
       // Emit error via WebSocket
-      wsService.emitError(errorMsg);
+      this.wsServer?.broadcastError(errorMsg);
 
       this.emitEvent({
         type: "error",
@@ -271,7 +273,7 @@ export class VaultMonitor {
     logger.info(`Monitoring cycle completed in ${cycleTime}ms\n`);
 
     // Emit cycle complete via WebSocket
-    wsService.emitCycleComplete(cycleTime);
+    this.wsServer?.broadcastCycleComplete(cycleTime);
   }
 
   /**

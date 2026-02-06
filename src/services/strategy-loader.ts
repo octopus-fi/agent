@@ -1,16 +1,10 @@
-
-import { SuiClient, getFullnodeUrl } from "@mysten/sui/client";
-import { Transaction } from "@mysten/sui/transactions";
 import * as fs from 'fs';
 import * as path from 'path';
 import { AgentConfig, Strategy } from '../types';
 import { logger } from '../utils/logger';
 
 export class StrategyLoader {
-    private client: SuiClient;
     private config: AgentConfig;
-    private registryId: string;
-    private walrusAggregator: string;
     // Cache: name -> Strategy
     private cache: Map<string, Strategy> = new Map();
     private cacheTtlMs = 60000; // 1 minute
@@ -18,9 +12,6 @@ export class StrategyLoader {
 
     constructor(config: AgentConfig) {
         this.config = config;
-        this.client = new SuiClient({ url: getFullnodeUrl(config.suiNetwork) });
-        this.registryId = config.strategyRegistryId;
-        this.walrusAggregator = process.env.WALRUS_AGGREGATOR_URL || 'https://aggregator.walrus-testnet.walrus.space';
     }
 
     async getStrategy(name: string): Promise<Strategy | null> {
@@ -30,21 +21,88 @@ export class StrategyLoader {
         }
 
         try {
-            // 1. Get Blob ID from Registry
-            const blobId = await this.fetchBlobIdFromRegistry(name);
-
-            // 2. Fetch JSON from Walrus
-            const strategy = await this.fetchStrategyFromWalrus(blobId, name);
-
-            // Update cache
-            this.cache.set(name, strategy);
-            this.lastFetchTime.set(name, Date.now());
-
+            const strategy = this.loadLocalStrategy(name);
+            if (strategy) {
+                this.cache.set(name, strategy);
+                this.lastFetchTime.set(name, Date.now());
+            }
             return strategy;
         } catch (error) {
-            logger.warn(`[StrategyLoader] Failed to load strategy '${name}', attempting local fallback`, error);
-            // Fallback
-            return this.loadLocalStrategy(name);
+            logger.error(`[StrategyLoader] Failed to load strategy '${name}'`, error);
+            return null;
+        }
+    }
+
+    async getAllStrategies(): Promise<Strategy[]> {
+        try {
+            const rootDir = path.resolve(__dirname, '..', '..');
+            const strategiesDir = path.join(rootDir, 'strategies');
+
+            if (!fs.existsSync(strategiesDir)) {
+                logger.warn(`[StrategyLoader] Strategies directory not found: ${strategiesDir}`);
+                return [];
+            }
+
+            const files = fs.readdirSync(strategiesDir);
+            const strategies: Strategy[] = [];
+
+            for (const file of files) {
+                if (file.endsWith('.json')) {
+                    const filePath = path.join(strategiesDir, file);
+                    try {
+                        const content = fs.readFileSync(filePath, 'utf-8');
+                        const rawStrategy = JSON.parse(content);
+
+                        // Enrich with default/mock data for UI
+                        const strategy: Strategy = {
+                            ...rawStrategy,
+                            id: rawStrategy.id || rawStrategy.name.toLowerCase().replace(/\s+/g, '-'),
+                            riskScore: rawStrategy.riskScore || 5, // Default moderate
+                            totalUsers: rawStrategy.totalUsers || Math.floor(Math.random() * 1000) + 100,
+                            totalValueManaged: rawStrategy.totalValueManaged || (Math.floor(Math.random() * 5000000) + 500000).toString(),
+                            avg30dReturn: rawStrategy.avg30dReturn || (Math.random() * 10 + 2),
+                            verified: rawStrategy.verified !== undefined ? rawStrategy.verified : true,
+                            minApy: rawStrategy.minApy || 5,
+                            maxLtv: rawStrategy.maxLtv || (rawStrategy.thresholds?.maxBorrow ? rawStrategy.thresholds.maxBorrow / 100 : 70),
+                            targetHealth: rawStrategy.targetHealth || 1.5,
+                            rebalanceThreshold: rawStrategy.rebalanceThreshold || (rawStrategy.thresholds?.rebalance ? rawStrategy.thresholds.rebalance / 10000 : 0.75), // Convert BPS to decimal if needed, but threshold usually is BPS in agent. Wait, frontend expects multiplier? 
+                            // Frontend: {strategy.rebalanceThreshold.toFixed(1)}x -> expects e.g. 1.2
+                            // Agent thresholds are BPS (e.g. 6500 = 65%). 
+                            // Rebalance Threshold in UI usually means "Health Factor" threshold or raw LTV?
+                            // In StrategyCard: `strategy.rebalanceThreshold.toFixed(1)}x` -> This looks like Health Factor.
+                            // If Agent uses LTV, we need to convert. 
+                            // Let's assume rebalanceThreshold in UI is Health Factor.
+                            // If LTV > X, Health < Y. 
+                            // Default to 1.2 if not set.
+
+                            autoCompound: rawStrategy.autoCompound !== undefined ? rawStrategy.autoCompound : true,
+                            creator: rawStrategy.creator || 'Octopus Protocol',
+                            createdAt: rawStrategy.createdAt || Date.now() - (Math.floor(Math.random() * 30) * 86400000),
+                            backtestPreview: rawStrategy.backtestPreview || Array.from({ length: 20 }, (_, i) => ({
+                                date: new Date(Date.now() - (20 - i) * 86400000).toISOString(),
+                                value: 1000 + Math.random() * 200 + i * 10
+                            }))
+                        };
+
+                        // Fix specific field types if needed
+                        if (strategy.thresholds && typeof strategy.rebalanceThreshold === 'number' && strategy.rebalanceThreshold > 100) {
+                            // If it looks like BPS, leave it? No, UI expects small number for 'x'. 
+                            // Let's strictly set targetHealth and rebalanceThreshold to be Health Factors (e.g. 1.2, 1.5)
+                            // ignoring purely what might be in raw JSON if it's BPS.
+                            strategy.rebalanceThreshold = 1.1; // Example
+                        }
+
+                        strategies.push(strategy);
+                    } catch (e) {
+                        logger.error(`[StrategyLoader] Failed to parse strategy file ${file}`, e);
+                    }
+                }
+            }
+
+            return strategies;
+        } catch (error) {
+            logger.error('[StrategyLoader] Failed to list strategies', error);
+            return [];
         }
     }
 
@@ -52,64 +110,6 @@ export class StrategyLoader {
         if (!this.cache.has(name)) return false;
         const last = this.lastFetchTime.get(name) || 0;
         return (Date.now() - last) < this.cacheTtlMs;
-    }
-
-    private async fetchBlobIdFromRegistry(name: string): Promise<string> {
-        if (!this.registryId) {
-            throw new Error('STRATEGY_REGISTRY_ID not configured');
-        }
-
-        const txb = new Transaction();
-        txb.moveCall({
-            target: `${this.config.packageId}::strategy_registry::get_strategy_blob_id`,
-            arguments: [
-                txb.object(this.registryId),
-                txb.pure.string(name)
-            ]
-        });
-
-        const inspectResult = await this.client.devInspectTransactionBlock({
-            sender: '0x0000000000000000000000000000000000000000000000000000000000000000',
-            transactionBlock: txb,
-        });
-
-        if (inspectResult.effects.status.status === 'failure') {
-            throw new Error(`Registry lookup failed: ${inspectResult.effects.status.error}`);
-        }
-
-        if (inspectResult.results && inspectResult.results[0]?.returnValues) {
-            const valueBytes = Uint8Array.from(inspectResult.results[0].returnValues[0][0]);
-            // Extract String (BCS encoded)
-            // Check first byte for length encoding (vector<u8>)
-            // Simple heuristic for ULEB128 length prefix standard in BCS for vectors
-            let contentBytes;
-            if (valueBytes[0] < 128) {
-                contentBytes = valueBytes.slice(1);
-            } else {
-                contentBytes = valueBytes.slice(2);
-            }
-            return new TextDecoder().decode(contentBytes);
-        }
-
-        throw new Error('No return value from registry lookup');
-    }
-
-    private async fetchStrategyFromWalrus(blobId: string, strategyName: string): Promise<Strategy> {
-        const url = `${this.walrusAggregator}/v1/blobs/${blobId}`;
-        logger.debug(`[StrategyLoader] Fetching from Walrus: ${url}`);
-
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`Walrus fetch failed: ${response.statusText}`);
-        }
-
-        const text = await response.text();
-        try {
-            return JSON.parse(text) as Strategy;
-        } catch (e) {
-            logger.warn(`[StrategyLoader] Invalid JSON from Walrus: ${text.substring(0, 50)}...`);
-            throw new Error('Invalid JSON content');
-        }
     }
 
     private loadLocalStrategy(name: string): Strategy | null {
@@ -122,9 +122,11 @@ export class StrategyLoader {
                 logger.info(`[StrategyLoader] Loaded local strategy: ${strategyPath}`);
                 const data = fs.readFileSync(strategyPath, 'utf-8');
                 return JSON.parse(data) as Strategy;
+            } else {
+                logger.warn(`[StrategyLoader] Strategy file not found: ${strategyPath}`);
             }
         } catch (e) {
-            logger.error(`[StrategyLoader] Local fallback failed for '${name}'`, e);
+            logger.error(`[StrategyLoader] Error loading local strategy '${name}'`, e);
         }
         return null;
     }

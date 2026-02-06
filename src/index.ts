@@ -4,9 +4,15 @@
 
 import { loadConfig } from "./config";
 import { VaultMonitor } from "./services/vault-monitor";
-import { getWebSocketService } from "./services/websocket-server";
+import { WebSocketServer } from "./services/websocket-server";
+import { StrategyLoader } from "./services/strategy-loader";
 import { logger } from "./utils/logger";
 import "dotenv/config";
+
+// Patch BigInt serialization for JSON
+(BigInt.prototype as any).toJSON = function () {
+  return this.toString();
+};
 
 async function main(): Promise<void> {
   logger.info("=".repeat(50));
@@ -19,27 +25,30 @@ async function main(): Promise<void> {
     logger.info(`Network: ${config.suiNetwork}`);
     logger.info(`Package ID: ${config.packageId}`);
 
-    // Initialize WebSocket server
-    const wsPort = parseInt(process.env.WEBSOCKET_PORT || "3001", 10);
-    const wsCorsOrigin = process.env.WEBSOCKET_CORS_ORIGIN || "http://localhost:3000";
-    const wsService = getWebSocketService(wsPort, wsCorsOrigin);
-    wsService.start();
-
-    // Initialize vault monitor
+    // Initialize Services
+    const strategyLoader = new StrategyLoader(config);
     const monitor = new VaultMonitor(config);
+
+    // Initialize WebSocket server
+    // Note: We're passing the strategyLoader so the WS server can fetch strategies
+    // We should also link the monitor to the WS server for broadcasting, or vice versa.
+    // For now, let's just start it.
+    const wsServer = new WebSocketServer(config, strategyLoader);
+    monitor.setWebSocketServer(wsServer);
+
 
     // Handle graceful shutdown
     process.on("SIGINT", () => {
       logger.info("Received SIGINT, shutting down...");
       monitor.stop();
-      wsService.stop();
+      wsServer.stop();
       process.exit(0);
     });
 
     process.on("SIGTERM", () => {
       logger.info("Received SIGTERM, shutting down...");
       monitor.stop();
-      wsService.stop();
+      wsServer.stop();
       process.exit(0);
     });
 

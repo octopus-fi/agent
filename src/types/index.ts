@@ -88,7 +88,6 @@ export interface AgentConfig {
   packageId: string;
   stakingPoolId: string;
   oracleId: string;
-  strategyRegistryId: string;
   aiCapabilityId: string;
   monitorIntervalSeconds: number;
   ltvThresholds: LtvThresholds;
@@ -107,10 +106,25 @@ export interface LtvThresholds {
 }
 
 export interface Strategy {
+  id?: string;
   name: string;
   description: string;
   thresholds: LtvThresholds;
   actionRules: string;
+  // UI Display Fields
+  riskScore?: number;
+  totalUsers?: number;
+  totalValueManaged?: string;
+  avg30dReturn?: number;
+  verified?: boolean;
+  minApy?: number;
+  maxLtv?: number;
+  targetHealth?: number;
+  rebalanceThreshold?: number;
+  autoCompound?: boolean;
+  creator?: string;
+  createdAt?: number;
+  backtestPreview?: any[];
 }
 
 export interface RateLimits {

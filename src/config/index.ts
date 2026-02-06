@@ -47,7 +47,6 @@ export function loadConfig(): AgentConfig {
     packageId: requireEnv('PACKAGE_ID'),
     stakingPoolId: requireEnv('STAKING_POOL_ID'),
     oracleId: requireEnv('ORACLE_ID'),
-    strategyRegistryId: requireEnv('STRATEGY_REGISTRY_ID'), // Matches .env
     aiCapabilityId: requireEnv('AI_CAPABILITY_ID'),
     monitorIntervalSeconds: optionalEnvNumber('MONITOR_INTERVAL_SECONDS', 10),
     ltvThresholds,
