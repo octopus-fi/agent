@@ -11,9 +11,10 @@ import {
   ExecutionResult,
   MonitoringEvent,
 } from "../types";
-import { SuiService } from "../services/sui-service";
+import { SuiService } from "./sui-service";
 import { AnalyzerAgent } from "../agents/analyzer";
 import { ExecutorAgent } from "../agents/executor";
+import { getWebSocketService } from "./websocket-server";
 import { logger } from "../utils/logger";
 import { SCALE_FACTOR } from "../config";
 
@@ -84,11 +85,9 @@ export class VaultMonitor {
     metricsMap: Map<string, VaultHealthMetrics>;
     metricsArray: VaultHealthMetrics[];
   } {
-    // Falls back to config sample/demo values
-    const realVaultId = this.authorizedVaults[0] || this.config.sampleVaultId || "";
+    const realVaultId = this.authorizedVaults[0] || "0x52d3644111f0cce9f27cfda9ec70bd55b1cbeb4d81a4f53a9bf145f41b183c68";
     const realPositionId =
-      this.autoRebalancePositions.get(realVaultId) || this.config.sampleStakePositionId || "";
-    const demoOwner = this.config.demoUserAddress || "";
+      this.autoRebalancePositions.get(realVaultId) || "0xf01c6a994c87fccf3e1670aa85a58782ff2b5fe7f1f1df32071bcc878eeafc4e";
 
     // Each scenario: [label, ltvBps, healthStatus, pendingRewards, rewardReserve]
     const scenarios: Array<{
@@ -170,7 +169,7 @@ export class VaultMonitor {
 
     const metrics: VaultHealthMetrics = {
       vaultId: scenario.id,
-      owner: demoOwner, // Triggers 'Degen' strategy
+      owner: "0x0e9e0287bf733d0771e1c3a16055eb947874e2c855f881f7f218ded75cb0e85a", // Triggers 'Degen' strategy
       collateralValue,
       debtValue,
       ltvBps: scenario.ltvBps,
@@ -198,6 +197,9 @@ export class VaultMonitor {
     const cycleStart = Date.now();
     logger.info("Starting monitoring cycle...");
 
+    // Get WebSocket service for emitting events
+    const wsService = getWebSocketService();
+
     try {
       await this.refreshCachedData();
 
@@ -205,8 +207,13 @@ export class VaultMonitor {
       const { metricsMap, metricsArray } = this.getDemoMetrics();
       // ────────────────────────────────────────────────────────────────────
 
+      // Emit cycle start via WebSocket
+      wsService.emitCycleStart(metricsArray.length);
+
       for (const m of metricsArray) {
         this.logVaultStatus(m);
+        // Emit vault health via WebSocket
+        wsService.emitVaultHealth(m);
       }
 
       // Run AI analysis (hits Gemini for every vault)
@@ -227,6 +234,8 @@ export class VaultMonitor {
         logger.info(
           `   → Action: ${a.action} | Reasoning: ${a.reasoning} | Confidence: ${a.confidence}`,
         );
+        // Emit AI analysis via WebSocket
+        wsService.emitAIAnalysis(a);
       }
 
       // Execute actions (hits Gemini tool-calling, then SuiService)
@@ -237,12 +246,22 @@ export class VaultMonitor {
       );
 
       this.logResultsSummary(results);
+
+      // Emit execution results via WebSocket
+      for (const result of results) {
+        wsService.emitAIExecution(result);
+      }
     } catch (error) {
       logger.error("Monitoring cycle error:", error);
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+
+      // Emit error via WebSocket
+      wsService.emitError(errorMsg);
+
       this.emitEvent({
         type: "error",
         details: {
-          error: error instanceof Error ? error.message : "Unknown error",
+          error: errorMsg,
         },
         timestamp: Date.now(),
       });
@@ -250,6 +269,9 @@ export class VaultMonitor {
 
     const cycleTime = Date.now() - cycleStart;
     logger.info(`Monitoring cycle completed in ${cycleTime}ms\n`);
+
+    // Emit cycle complete via WebSocket
+    wsService.emitCycleComplete(cycleTime);
   }
 
   /**
