@@ -34,7 +34,7 @@ export class WebSocketServer {
         this.strategyLoader = strategyLoader;
 
         // Port configuration
-        const port = process.env.WS_PORT ? parseInt(process.env.WS_PORT) : 3001;
+        const port = process.env.PORT ? parseInt(process.env.PORT) : (process.env.WS_PORT ? parseInt(process.env.WS_PORT) : (process.env.WEBSOCKET_PORT ? parseInt(process.env.WEBSOCKET_PORT) : 3001));
 
         this.io = new Server(port, {
             cors: {
